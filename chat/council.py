@@ -8,12 +8,16 @@ from dotenv import load_dotenv
 load_dotenv()
 
 HF_TOKEN = os.getenv("HF_TOKEN")
-API_URL = os.getenv("API_URL", "https://api-inference.huggingface.co/v1/chat/completions")
+if not HF_TOKEN:
+    print(
+        "⚠️  WARNING: HF_TOKEN is not set. API calls to Hugging Face will likely fail (401 Unauthorized)."
+    )
+    print("   Please create a .env file with HF_TOKEN=your_token_here")
 
-headers = {
-    "Authorization": f"Bearer {HF_TOKEN}",
-    "Content-Type": "application/json"
-}
+API_URL = os.getenv("API_URL", "https://router.huggingface.co/v1/chat/completions")
+
+headers = {"Authorization": f"Bearer {HF_TOKEN}", "Content-Type": "application/json"}
+
 
 def query_llm(model_id, messages, max_tokens=200):
     """
@@ -25,7 +29,7 @@ def query_llm(model_id, messages, max_tokens=200):
         "messages": messages,
         "max_tokens": max_tokens,
         "stream": False,
-        "temperature": 0.7
+        "temperature": 0.7,
     }
 
     try:
@@ -56,7 +60,7 @@ def query_llm(model_id, messages, max_tokens=200):
         return None
     except requests.exceptions.RequestException as e:
         print(f"❌ Network error querying {model_id}: {e}")
-        if hasattr(e, 'response') and e.response is not None:
+        if hasattr(e, "response") and e.response is not None:
             print(f"   Response body: {e.response.text[:500]}")
         return None
     except Exception as e:
@@ -67,9 +71,11 @@ def query_llm(model_id, messages, max_tokens=200):
 def get_round_answers(question, active_members, round_num, previous_answers=None):
     """
     Queries all active members.
-    If Round 2, includes context of previous answers for re-evaluation.
+    If Round 2+, includes context of previous answers for re-evaluation.
     """
-    print(f"\n📝 Round {round_num}: Collecting answers from {len(active_members)} members")
+    print(
+        f"\n📝 Round {round_num}: Collecting answers from {len(active_members)} members"
+    )
     print(f"   Active members: {', '.join(active_members)}")
     current_answers = {}
 
@@ -82,7 +88,13 @@ def get_round_answers(question, active_members, round_num, previous_answers=None
             messages = [
                 {"role": "user", "content": question},
                 {"role": "assistant", "content": prev_response},
-                {"role": "user", "content": "Review your previous answer. Consider that other models might have offered different perspectives. Refine your answer to be more accurate and concise."}
+                {
+                    "role": "user",
+                    "content": (
+                        "Review your previous answer. Consider that other models might have "
+                        "offered different perspectives. Refine your answer to be more accurate and concise."
+                    ),
+                },
             ]
 
         response = query_llm(member, messages)
@@ -95,7 +107,11 @@ def get_round_answers(question, active_members, round_num, previous_answers=None
             current_answers[member] = "Failed to generate answer."
             print(f"   ❌ Failed to get answer from {member}")
 
-    print(f"\n✅ Round {round_num} complete: {len([a for a in current_answers.values() if a != 'Failed to generate answer.'])}/{len(active_members)} successful answers")
+    print(
+        f"\n✅ Round {round_num} complete: "
+        f"{len([a for a in current_answers.values() if a != 'Failed to generate answer.'])}/"
+        f"{len(active_members)} successful answers"
+    )
     return current_answers
 
 
@@ -124,7 +140,9 @@ def collect_votes(question, answers):
 
     for idx, voter in enumerate(answers.keys(), 1):
         print(f"\n   [{idx}/{len(answers)}] {voter} is voting...")
-        vote_response = query_llm(voter, [{"role": "user", "content": voting_prompt}], max_tokens=100)
+        vote_response = query_llm(
+            voter, [{"role": "user", "content": voting_prompt}], max_tokens=100
+        )
         if vote_response:
             votes_summary.append(f"{voter} voted: {vote_response}")
             detailed_votes[voter] = vote_response
@@ -134,7 +152,11 @@ def collect_votes(question, answers):
             detailed_votes[voter] = "Failed to vote"
             print(f"   ❌ {voter} failed to vote")
 
-    print(f"\n✅ Voting complete: {len([v for v in detailed_votes.values() if v != 'Failed to vote'])}/{len(answers)} successful votes")
+    print(
+        f"\n✅ Voting complete: "
+        f"{len([v for v in detailed_votes.values() if v != 'Failed to vote'])}/"
+        f"{len(answers)} successful votes"
+    )
     return votes_summary, model_map, detailed_votes
 
 
@@ -162,14 +184,16 @@ def arbiter_eliminate(question, answers, votes, model_map):
         "First explain your reasoning in 1-2 sentences, then end with 'ELIMINATE: [exact Model ID]' on a new line."
     )
 
-    decision = query_llm(ARBITER_MODEL, [{"role": "user", "content": arbiter_prompt}], max_tokens=150)
+    decision = query_llm(
+        ARBITER_MODEL, [{"role": "user", "content": arbiter_prompt}], max_tokens=150
+    )
 
     # Parse the decision
     eliminated = None
     reasoning = decision if decision else "Failed to get arbiter decision"
 
     if decision:
-        print(f"\n   📜 Arbiter's full decision:")
+        print("\n   📜 Arbiter's full decision:")
         print(f"      {decision}")
         # Try to extract the model ID
         for model_id in answers.keys():
@@ -188,32 +212,57 @@ def arbiter_eliminate(question, answers, votes, model_map):
     return eliminated, reasoning
 
 
-def ensemble_result(question, final_answers):
+def ensemble_result(
+    question, final_answers, eliminated_answers=None, synthesizer_id=None
+):
     """
-    Combines the final 3 answers into one cohesive response.
+    Combines the final answer (survivor) and eliminated answers into one cohesive response.
+    synthesizer_id: The model ID of the survivor who will generate the final answer.
     """
     from chat.config import ARBITER_MODEL
 
-    print(f"\n🎼 Creating final ensemble from {len(final_answers)} survivors:")
-    for model in final_answers.keys():
-        print(f"   - {model}")
+    # Use synthesizer_id if provided, else default to Arbiter
+    target_model = synthesizer_id if synthesizer_id else ARBITER_MODEL
+
+    print(f"\n🎼 Creating final ensemble with {target_model}...")
 
     combined_text = ""
+    # Survivor's answer
     for model, ans in final_answers.items():
-        combined_text += f"Perspective from {model}:\n{ans}\n\n"
+        combined_text += f"SURVIVOR ({model}):\n{ans}\n\n"
+
+    # Eliminated answers
+    if eliminated_answers:
+        combined_text += "PREVIOUS PERSPECTIVES (ELIMINATED):\n"
+        for model, ans in eliminated_answers.items():
+            combined_text += f"From {model}:\n{ans}\n\n"
+
+    if target_model == ARBITER_MODEL:
+        task_prompt = (
+            "Task: You are the Council Arbiter. "
+            "Synthesize these perspectives into one perfect, comprehensive, and accurate master answer."
+        )
+    else:
+        task_prompt = (
+            "Task: You are the sole survivor of the Council. "
+            "Synthesize your own winning answer along with valid points from the eliminated models into one perfect, "
+            "comprehensive, and accurate master answer."
+        )
 
     ensemble_prompt = (
         f"User Question: {question}\n\n"
-        f"Here are the answers from the top 3 AI models:\n{combined_text}\n"
-        f"Task: Synthesize these 3 answers into one perfect, comprehensive, and accurate master answer."
+        f"Here are the perspectives:\n{combined_text}\n"
+        f"{task_prompt}"
     )
 
-    print(f"\n   Synthesizing with {ARBITER_MODEL}...")
-    final_output = query_llm(ARBITER_MODEL, [{"role": "user", "content": ensemble_prompt}], max_tokens=500)
+    print(f"\n   Synthesizing with {target_model}...")
+    final_output = query_llm(
+        target_model, [{"role": "user", "content": ensemble_prompt}], max_tokens=500
+    )
 
     if final_output:
         print(f"\n✨ Final answer generated successfully ({len(final_output)} chars)")
     else:
-        print(f"\n❌ Failed to generate final answer")
+        print("\n❌ Failed to generate final answer")
 
     return final_output
